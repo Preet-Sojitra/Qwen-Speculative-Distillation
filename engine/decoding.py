@@ -94,7 +94,8 @@ def speculative(
 
                 if log_features:
                     q_j      = draft_probs[j]
-                    entropy  = -(q_j * torch.log(q_j + 1e-10)).sum().item()
+                    q_j_f    = q_j.float()
+                    entropy  = -(q_j_f * torch.log(q_j_f + 1e-10)).sum().item()
                     max_prob = q_j.max().item()
                     token_records.append({
                         "entropy":  entropy,
@@ -117,7 +118,8 @@ def speculative(
                 )
 
                 if log_features:
-                    entropy  = -(q_j * torch.log(q_j + 1e-10)).sum().item()
+                    q_j_f    = q_j.float()
+                    entropy  = -(q_j_f * torch.log(q_j_f + 1e-10)).sum().item()
                     max_prob = q_j.max().item()
                     token_records.append({
                         "entropy":  entropy,
