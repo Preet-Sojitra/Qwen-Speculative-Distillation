@@ -178,3 +178,163 @@ def speculative(
             if log_features:
                 return generated, total_draft_tokens, total_accepted_tokens, token_records
             return generated, total_draft_tokens, total_accepted_tokens
+
+
+@torch.no_grad()
+def speculative_dynamic(
+    target_model,
+    draft_model,
+    input_ids,
+    max_new_tokens,
+    max_gamma,
+    min_gamma,
+    halt_threshold,
+    halting_predict_fn,
+    eos_token_id,
+    device,
+    greedy=True,
+):
+    """
+    Speculative Decoding with Dynamic Halting.
+
+    Same algorithm as `speculative()`, but the draft loop consults a
+    trained MLP after each draft step (once ≥ min_gamma tokens have been
+    drafted).  If the MLP's predicted acceptance probability falls below
+    `halt_threshold`, drafting stops early — making gamma dynamic.
+
+    Args:
+        target_model:       The large target model M_p.
+        draft_model:        The small draft model M_q.
+        input_ids:          (1, prefix_len) prompt token IDs.
+        max_new_tokens:     Maximum tokens to generate.
+        max_gamma:          Upper bound on speculation length (was `gamma`).
+        min_gamma:          Lower bound — always draft at least this many.
+        halt_threshold:     Confidence cutoff in [0, 1]. Below this the MLP
+                            says "target will likely reject".  (e.g. 0.5)
+        halting_predict_fn: Callable(entropy, max_prob) → float [0, 1].
+                            Returned by `engine.halting.load_halting_mlp()`.
+        eos_token_id:       Token ID for end-of-sequence.
+        device:             Torch device string.
+        greedy:             If True, use argmax; otherwise multinomial.
+
+    Returns:
+        generated_ids         — 1-D tensor of new token IDs (no prompt).
+        total_draft_tokens    — Total tokens proposed by the draft model.
+        total_accepted_tokens — Draft tokens accepted by the target model.
+        actual_gammas         — List of per-iteration gamma values used,
+                                for analysis of halting behaviour.
+    """
+    current_ids = input_ids.clone()
+
+    total_draft_tokens    = 0
+    total_accepted_tokens = 0
+    actual_gammas         = []          # track dynamic gamma per iteration
+
+    while True:
+        if current_ids.shape[1] - input_ids.shape[1] >= max_new_tokens:
+            break
+
+        budget = min(max_gamma, max_new_tokens - (current_ids.shape[1] - input_ids.shape[1]))
+
+        # ── STEP 1: Draft tokens from M_q with dynamic halting 
+        draft_tokens = []
+        draft_probs  = []
+
+        draft_ids = current_ids.clone()
+        for j in range(budget):
+            q_logits = draft_model(draft_ids).logits
+            q        = F.softmax(q_logits[:, -1, :], dim=-1)
+
+            # ── Dynamic halting check (after min_gamma drafts)
+            if j >= min_gamma:
+                q_f      = q.float()
+                entropy  = -(q_f * torch.log(q_f + 1e-10)).sum().item()
+                max_prob = q.max().item()
+                accept_prob = halting_predict_fn(entropy, max_prob)
+                if accept_prob < halt_threshold:
+                    break                       # stop drafting early
+
+            if greedy:
+                x = torch.argmax(q, dim=-1)
+            else:
+                x = torch.multinomial(q, num_samples=1).squeeze(-1)
+            draft_tokens.append(x.item())
+            draft_probs.append(q)
+            draft_ids = torch.cat([draft_ids, x.view(1, 1)], dim=-1)
+
+        current_gamma = len(draft_tokens)       # actual drafts this iteration
+        actual_gammas.append(current_gamma)
+
+        if current_gamma == 0:
+            # MLP halted immediately (shouldn't happen if min_gamma >= 1,
+            # but handle gracefully): fall through to bonus-only token.
+            draft_tensor = torch.zeros((1, 0), dtype=torch.long, device=device)
+            verify_ids   = current_ids.clone()
+        else:
+            draft_tensor = torch.tensor([draft_tokens], dtype=torch.long, device=device)
+            verify_ids   = torch.cat([current_ids, draft_tensor], dim=-1)
+
+        total_draft_tokens += current_gamma
+
+        # STEP 2: Verify drafts with M_p in ONE forward pass 
+        p_logits   = target_model(verify_ids).logits
+        prefix_len = current_ids.shape[1]
+
+        # STEP 3: Accept / Reject
+        n = 0
+        if greedy:
+            for j in range(current_gamma):
+                p_j = F.softmax(p_logits[:, prefix_len - 1 + j, :], dim=-1)
+                if torch.argmax(p_j, dim=-1).item() == draft_tokens[j]:
+                    n += 1
+                else:
+                    break
+        else:
+            for j in range(current_gamma):
+                p_j = F.softmax(p_logits[:, prefix_len - 1 + j, :], dim=-1)
+                q_j = draft_probs[j]
+                x_j = draft_tokens[j]
+                r   = torch.rand(1, device=device)
+                if r.item() < min(1.0, (p_j[0, x_j] / q_j[0, x_j]).item()):
+                    n += 1
+                else:
+                    break
+
+        total_accepted_tokens += n
+
+        # STEP 4: Bonus token
+        p_bonus = F.softmax(p_logits[:, prefix_len - 1 + n, :], dim=-1)
+
+        if greedy:
+            bonus_token = torch.argmax(p_bonus, dim=-1).item()
+        else:
+            if n < current_gamma:
+                q_n      = draft_probs[n]
+                adjusted = torch.clamp(p_bonus - q_n, min=0.0)
+                adj_sum  = adjusted.sum()
+                adjusted = adjusted / adj_sum if adj_sum > 1e-10 else p_bonus
+                bonus_token = torch.multinomial(adjusted, num_samples=1).item()
+            else:
+                bonus_token = torch.multinomial(p_bonus, num_samples=1).item()
+
+        # STEP 5: Commit and check EOS
+        new_tokens = draft_tokens[:n] + [bonus_token]
+
+        eos_pos = None
+        for i, tok in enumerate(new_tokens):
+            if tok == eos_token_id:
+                eos_pos = i
+                break
+
+        if eos_pos is not None:
+            new_tokens = new_tokens[:eos_pos + 1]
+
+        new_tensor = torch.tensor([new_tokens], dtype=torch.long, device=device)
+        current_ids = torch.cat([current_ids, new_tensor], dim=-1)
+
+        tokens_generated = current_ids.shape[1] - input_ids.shape[1]
+        if eos_pos is not None or tokens_generated >= max_new_tokens:
+            generated = current_ids[0, input_ids.shape[1]:]
+            if len(generated) > max_new_tokens:
+                generated = generated[:max_new_tokens]
+            return generated, total_draft_tokens, total_accepted_tokens, actual_gammas
