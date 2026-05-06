@@ -131,51 +131,40 @@ def build_dataloader(tokenizer_d, args: argparse.Namespace) -> DataLoader:
 
     return DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
-
 def compute_distillation_loss(
     target_logits: torch.Tensor,
     draft_logits: torch.Tensor,
-    attention_mask: torch.Tensor,
+    labels: torch.Tensor,           # <-- Added labels as an argument
     temperature: float,
     top_k: int,
 ) -> torch.Tensor:
-    """
-    Top-K KL-divergence distillation loss, masked to only count non-padding
-    token positions.
+    
+    # 1. SHIFT the logits and labels (predicting the NEXT token)
+    shift_logits_t = target_logits[..., :-1, :].contiguous()
+    shift_logits_d = draft_logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
 
-    Args:
-        target_logits: (B, S, V) float32 logits from the frozen target model.
-        draft_logits:  (B, S, V) float32 logits from the trainable draft model.
-        attention_mask: (B, S) binary mask (1 = real token, 0 = padding).
-        temperature: softmax temperature for softer distributions.
-        top_k: number of top vocabulary entries to distill over.
+    # 2. Only distill on the Assistant's response (where labels != -100)
+    mask = (shift_labels != -100).float()
 
-    Returns:
-        Scalar KL-divergence loss, averaged over non-padding positions.
-    """
-    # Select the top-K vocabulary indices according to the teacher
-    _, topk_idx = torch.topk(target_logits, k=top_k, dim=-1)       # (B, S, K)
-    topk_logits_t = target_logits.gather(-1, topk_idx)              # (B, S, K)
-    topk_logits_d = draft_logits.gather(-1, topk_idx)               # (B, S, K)
+    # 3. Top-K Selection
+    _, topk_idx = torch.topk(shift_logits_t, k=top_k, dim=-1)
+    topk_logits_t = shift_logits_t.gather(-1, topk_idx)
+    topk_logits_d = shift_logits_d.gather(-1, topk_idx)
 
-    # Tempered log-probabilities
-    log_p_t = F.log_softmax(topk_logits_t / temperature, dim=-1)    # (B, S, K)
-    log_p_d = F.log_softmax(topk_logits_d / temperature, dim=-1)    # (B, S, K)
+    # 4. Tempered Log-Probs
+    log_p_t = F.log_softmax(topk_logits_t / temperature, dim=-1)
+    log_p_d = F.log_softmax(topk_logits_d / temperature, dim=-1)
 
-    # Per-position KL:  sum_k  p_t(k) * [log p_t(k) - log p_d(k)]
-    kl_per_pos = (log_p_t.exp() * (log_p_t - log_p_d)).sum(dim=-1) # (B, S)
+    # 5. Calculate KL Divergence
+    kl_per_pos = (log_p_t.exp() * (log_p_t - log_p_d)).sum(dim=-1)
 
-    # Mask out padding positions
-    mask = attention_mask.float()                                    # (B, S)
+    # 6. Apply mask and average
     kl_per_pos = kl_per_pos * mask
-
-    # Average over non-padding positions (not over the full 512-length)
     num_real_tokens = mask.sum().clamp(min=1.0)
     distill_loss = kl_per_pos.sum() / num_real_tokens
 
-    # Scale by T² (standard distillation gradient correction)
     return distill_loss * (temperature ** 2)
-
 
 def save_checkpoint(model_d, tokenizer_d, optimizer, epoch, step, loss, args):
     ckpt_name = f"epoch{epoch + 1}_step{step + 1}"
@@ -250,7 +239,7 @@ def train(args: argparse.Namespace):
             distill_loss = compute_distillation_loss(
                 target_logits=target_logits,
                 draft_logits=draft_logits,
-                attention_mask=attention_mask,
+                labels=labels,
                 temperature=args.temperature,
                 top_k=args.top_k,
             )

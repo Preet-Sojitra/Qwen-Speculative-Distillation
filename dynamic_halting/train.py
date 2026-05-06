@@ -12,8 +12,13 @@ def main():
     # Configuration
     data_path = Path(__file__).parent.parent / "data" / "data_for_MLP.csv"
     batch_size = 64
-    epochs = 20
+    epochs = 100
     learning_rate = 1e-3
+    patience = 10          # early-stop after this many epochs with no val-loss improvement
+    
+    output_dir = Path(__file__).parent.parent / "weights" / "mlp"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model_path = output_dir / "mlp_weights.pt"
     
     print(f"Loading dataset from {data_path}...")
     full_dataset = DraftLogitsDataset(data_path)
@@ -32,6 +37,9 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     
     print(f"Starting training on {len(train_dataset)} samples, validating on {len(val_dataset)} samples...")
+    
+    best_val_loss = float("inf")
+    epochs_without_improvement = 0
     
     for epoch in range(epochs):
         model.train()
@@ -66,14 +74,26 @@ def main():
         val_loss /= len(val_dataset)
         val_accuracy = correct / total
         
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_accuracy*100:.2f}%")
+        # ── Best-model checkpointing ──
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_without_improvement = 0
+            torch.save(model.state_dict(), model_path)
+            marker = " ✓ saved"
+        else:
+            epochs_without_improvement += 1
+            marker = ""
+        
+        if (epoch + 1) % 5 == 0 or epoch == 0 or marker:
+            print(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_accuracy*100:.2f}%{marker}")
+        
+        # ── Early stopping ──
+        if epochs_without_improvement >= patience:
+            print(f"\nEarly stopping at epoch {epoch+1} (no improvement for {patience} epochs).")
+            break
             
-    # Save the model
-    output_dir = Path(__file__).parent.parent / "weights"
-    model_path = output_dir / "mlp_weights.pt"
-    torch.save(model.state_dict(), model_path)
-    print(f"\nTraining complete! Weights saved to {model_path}")
+    print(f"\nTraining complete! Best Val Loss: {best_val_loss:.4f}")
+    print(f"Best weights saved to {model_path}")
     
     # Save the normalisation params
     norm_params = full_dataset.get_norm_params()

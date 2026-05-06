@@ -82,6 +82,13 @@ def load_model_and_tokenizer(args: argparse.Namespace):
         load_in_4bit=args.load_in_4bit,
     )
 
+    chat_template = "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n{% endif %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+    
+    tokenizer.chat_template = chat_template
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     model = FastLanguageModel.get_peft_model(
         model,
         r=args.lora_r,

@@ -26,6 +26,7 @@ import torch
 from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
 
 # ── Project imports ───────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -37,7 +38,7 @@ from engine.halting import load_halting_mlp
 
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 DEFAULT_NUM_PROMPTS   = 20
-DEFAULT_MAX_NEW_TOKENS = 128
+DEFAULT_MAX_NEW_TOKENS = 512
 DEFAULT_GAMMA          = 4
 DEFAULT_MAX_GAMMA      = 6
 DEFAULT_MIN_GAMMA      = 1
@@ -86,30 +87,42 @@ def load_target_model():
     return model
 
 
-def load_draft_model(checkpoint_path=None):
+def load_draft_model(model_type="baseline", checkpoint_dir=None):
     """
-    Load a draft model.
-    - checkpoint_path=None  → off-the-shelf 0.5B
-    - checkpoint_path=<path> → load base 0.5B then overlay checkpoint weights
+    Safely load the different draft models based on how they were trained.
     """
-    if checkpoint_path is not None:
-        print(f"[INFO] Loading draft model with checkpoint: {checkpoint_path}")
+    if model_type == "baseline":
+        print(f"[INFO] Loading off-the-shelf Draft (Instruct): Qwen/Qwen2.5-Coder-0.5B-Instruct")
         model = AutoModelForCausalLM.from_pretrained(
-            DRAFT_MODEL_ID, torch_dtype=DTYPE, device_map=DEVICE,
+            "Qwen/Qwen2.5-Coder-0.5B-Instruct", torch_dtype=DTYPE, device_map=DEVICE,
         ).eval()
-        state_dict = torch.load(checkpoint_path, map_location=DEVICE, weights_only=True)
-        model.load_state_dict(state_dict, strict=False)
-        print("[INFO] Draft checkpoint weights loaded.")
+        return model
+
+    elif model_type == "sft":
+        print(f"[INFO] Loading Base model + SFT LoRA Adapter from: {checkpoint_dir}")
+        base_model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen2.5-Coder-0.5B", torch_dtype=DTYPE, device_map=DEVICE,
+        )
+        # Load the LoRA weights onto the Base model
+        model = PeftModel.from_pretrained(base_model, checkpoint_dir)
+        return model.eval()
+
+    elif model_type == "kd":
+        print(f"[INFO] Loading full KD model from: {checkpoint_dir}")
+        # The KD script saved the full model directly to the output dir
+        model = AutoModelForCausalLM.from_pretrained(
+            checkpoint_dir, torch_dtype=DTYPE, device_map=DEVICE,
+        ).eval()
+        return model
+    
     else:
-        print(f"[INFO] Loading off-the-shelf draft model: {DRAFT_MODEL_ID}")
-        model = AutoModelForCausalLM.from_pretrained(
-            DRAFT_MODEL_ID, torch_dtype=DTYPE, device_map=DEVICE,
-        ).eval()
-    return model
+        raise ValueError("Unknown model_type")
 
 
 def load_tokenizer():
-    return AutoTokenizer.from_pretrained(TARGET_MODEL_ID)
+    tokenizer = AutoTokenizer.from_pretrained(TARGET_MODEL_ID)
+    # need to add the template here. 
+    return tokenizer
 
 
 # ─── Dataset ──────────────────────────────────────────────────────────────────
@@ -340,46 +353,39 @@ def main():
     table1_rows = []
 
     # Row 1: Off-the-shelf draft (always run)
-    draft_baseline = load_draft_model(checkpoint_path=None)
+    # TABLE 1: Row 1 (Baseline)
+    draft_baseline = load_draft_model(model_type="baseline")
     m = run_speculative_fixed(
         target_model, draft_baseline, tokenizer, prompts,
-        args.max_new_tokens, args.gamma,
-        label="Off-the-shelf 0.5B",
+        args.max_new_tokens, args.gamma, label="Off-the-shelf 0.5B (Instruct)"
     )
-    m["label"] = "Off-the-shelf 0.5B"
+    m["label"] = "Off-the-shelf 0.5B (Instruct)"
     table1_rows.append(m)
     del draft_baseline
     torch.cuda.empty_cache()
 
-    # Row 2: LoRA SFT draft (skip if path not provided)
+    # TABLE 1: Row 2 (SFT)
     if args.sft_draft_path:
-        draft_sft = load_draft_model(checkpoint_path=args.sft_draft_path)
+        draft_sft = load_draft_model(model_type="sft", checkpoint_dir=args.sft_draft_path)
         m = run_speculative_fixed(
             target_model, draft_sft, tokenizer, prompts,
-            args.max_new_tokens, args.gamma,
-            label="LoRA SFT 0.5B",
+            args.max_new_tokens, args.gamma, label="LoRA SFT 0.5B (Base)"
         )
-        m["label"] = "LoRA SFT 0.5B"
+        m["label"] = "LoRA SFT 0.5B (Base)"
         table1_rows.append(m)
         del draft_sft
         torch.cuda.empty_cache()
-    else:
-        print("\n[SKIP] SFT draft row — no --sft_draft_path provided.")
 
-    # Row 3: KD draft (skip if path not provided)
-    kd_metrics = None
-    draft_kd   = None
+    # TABLE 1: Row 3 (KD)
     if args.kd_draft_path:
-        draft_kd = load_draft_model(checkpoint_path=args.kd_draft_path)
+        draft_kd = load_draft_model(model_type="kd", checkpoint_dir=args.kd_draft_path)
         m = run_speculative_fixed(
             target_model, draft_kd, tokenizer, prompts,
-            args.max_new_tokens, args.gamma,
-            label="KD 0.5B",
+            args.max_new_tokens, args.gamma, label="KD 0.5B (Base)"
         )
-        m["label"] = "KD 0.5B"
+        m["label"] = "KD 0.5B (Base)"
         kd_metrics = m
         table1_rows.append(m)
-        # Keep draft_kd alive for Table 2
     else:
         print("\n[SKIP] KD draft row — no --kd_draft_path provided.")
 
